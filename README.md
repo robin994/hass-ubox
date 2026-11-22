@@ -157,8 +157,7 @@ add-on Configuration tab; built locally (no prebuilt image needed).
 ```
 ubox/
   config.yaml   add-on manifest (amd64/aarch64, host_network)
-  build.yaml    base images
-  Dockerfile    python:3.12-slim + ffmpeg + qemu-aarch64-static
+  Dockerfile    python:3.12-slim-bookworm + ffmpeg + qemu-aarch64-static
   run.py        supervisor: on-demand qemu → ffmpeg → MJPEG, watchdog
   bin/          rehost + lib29.so (crash-patched) helpers
   rootfs/       slim bionic (linker64 + libc/dl/m/log/stdc++/c++_shared, ~3.4 MB)

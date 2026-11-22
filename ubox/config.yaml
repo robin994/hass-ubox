@@ -1,5 +1,5 @@
 name: UBox Camera
-version: "0.8.0"
+version: "0.8.1"
 slug: ubox
 description: UBox camera live stream for Home Assistant (local, on-demand MJPEG with auto-reconnect)
 url: https://github.com/robin994/hass-ubox

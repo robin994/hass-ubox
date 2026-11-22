@@ -1,5 +1,7 @@
-ARG BUILD_FROM=python:3.12-slim-bookworm
-FROM ${BUILD_FROM}
+# Base image is fixed on purpose: the Supervisor passes
+# BUILD_FROM=ghcr.io/home-assistant/base (Alpine, no apt-get) when there is
+# no valid build.yaml, so an "ARG BUILD_FROM" default would be overridden.
+FROM docker.io/library/python:3.12-slim-bookworm
 
 ENV LANG=C.UTF-8 \
     APP=/app \
