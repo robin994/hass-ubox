@@ -1120,6 +1120,14 @@ def _new_branch_state():
             "backoff_s": 0, "next_start_t": 0.0}
 
 
+def _new_metrics():
+    # Rolling diagnostics for /stats (reset on every pipeline start).
+    return {"in": collections.deque(maxlen=2000),   # (t, bytes, is_key)
+            "dec": collections.deque(maxlen=2000),  # t of decoded JPEG
+            "next_reads": 0, "stable_reads": 0, "late_writes": 0,
+            "skips": 0, "skipped_frames": 0, "fferr": 0, "cpu": {}}
+
+
 def _new_branch(bid, name, transport, rundir, hlsdir):
     return {"id": bid, "name": name, "transport": transport,
             "PIPE": {"cap": None, "ff": None, "rundir": "", "hls": None,
@@ -1131,6 +1139,7 @@ def _new_branch(bid, name, transport, rundir, hlsdir):
             "thread": None, "want_stop": False,
             "caplog": collections.deque(maxlen=60),
             "fflog": collections.deque(maxlen=20),
+            "M": _new_metrics(),
             "rundir": rundir, "hlsdir": hlsdir,
             "pid": None, "pidrules": [], "iso": "unset"}
 
@@ -1748,6 +1757,11 @@ def has_params(b):
     return 32 in types and 33 in types and 34 in types
 
 
+def _is_key(b):
+    """True when the access unit carries an IRAP (IDR/CRA/BLA) slice."""
+    return any(16 <= ((m[0] >> 1) & 0x3F) <= 21 for m in NAL_RE.findall(b))
+
+
 def _vps_off(b):
     """Offset of the first VPS NAL (type 32) in b, or -1."""
     i = b.find(b"\x00\x00\x00\x01")
@@ -1760,14 +1774,15 @@ def _vps_off(b):
 
 # ---- Live pipeline tuning.
 POLL_S = 0.01          # frame-file poll interval (was 150 ms per miss)
-STABLE_S = 0.04        # last file must keep its size this long
+STABLE_S = 0.25        # newest file must keep its size this long (only
+                       # used when the next file has not appeared yet)
 STARTUP_TIMEOUT = 75   # cold start: P2P handshake + first IDR
 BACKOFF_MIN, BACKOFF_MAX = 3, 60
 JANITOR_S = 30
 JANITOR_MAX_BYTES = 20 * 1024 * 1024
 
 
-def _drain_lines(stream, sink):
+def _drain_lines(stream, sink, counter=None):
     """Keep reading a child's output so it can never block on a full pipe.
 
     The old code gave rehost a stdout PIPE that nobody read: once its
@@ -1778,6 +1793,8 @@ def _drain_lines(stream, sink):
         for line in iter(stream.readline, b""):
             sink.append(line.decode("utf-8", errors="replace")
                         .rstrip()[:300])
+            if counter is not None:
+                counter[0][counter[1]] += 1
     except Exception:
         pass
     finally:
@@ -1795,6 +1812,7 @@ def _publish_frame(br, jpg):
         lt["seq"] += 1
         lt["t"] = now
         br["ST"]["decoded"] += 1
+        br["M"]["dec"].append(now)
     with FRAME_COND:
         FRAME_SEQ[0] += 1
         FRAME_COND.notify_all()
@@ -1988,6 +2006,56 @@ def _live_hls_segs(hlsdir):
         return 0
 
 
+_CLK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+
+
+def _cpu_pct(M, key, pid, now):
+    """CPU % of pid since the previous /stats call (Linux /proc only)."""
+    if not pid:
+        return None
+    try:
+        with open("/proc/%d/stat" % pid) as fh:
+            f = fh.read().rsplit(")", 1)[1].split()
+        ticks = int(f[11]) + int(f[12])
+    except (OSError, ValueError, IndexError):
+        return None
+    prev = M["cpu"].get(key)
+    M["cpu"][key] = (now, ticks, pid)
+    if not prev or prev[2] != pid or now - prev[0] < 0.5:
+        return None
+    return round(100.0 * (ticks - prev[1]) / _CLK / (now - prev[0]), 1)
+
+
+def _diag(br, now, win=10.0):
+    """Frame-rate / bitrate / GOP / CPU over the last `win` seconds."""
+    M = br["M"]
+    with LOCK:
+        ins = [x for x in M["in"] if now - x[0] <= win]
+        decs = [t for t in M["dec"] if now - t <= win]
+    span = win
+    if ins:
+        span = min(win, max(1.0, now - ins[0][0]))
+    keys = [t for t, _, k in ins if k]
+    gop = (round((keys[-1] - keys[0]) / (len(keys) - 1), 2)
+           if len(keys) > 1 else None)
+    sizes = [z for _, z, _ in ins]
+    cap, ff = br["PIPE"].get("cap"), br["PIPE"].get("ff")
+    return {"in_fps": round(len(ins) / span, 1),
+            "in_kbps": round(sum(sizes) * 8 / 1000 / span),
+            "avg_frame_kb": (round(sum(sizes) / len(sizes) / 1024, 1)
+                             if sizes else None),
+            "max_frame_kb": (round(max(sizes) / 1024, 1) if sizes else None),
+            "keyframes": len(keys), "gop_s": gop,
+            "decoded_fps": round(len(decs) / span, 1),
+            "reads_next": M["next_reads"], "reads_stable": M["stable_reads"],
+            "late_writes": M["late_writes"], "skips": M["skips"],
+            "skipped_frames": M["skipped_frames"],
+            "decoder_errors": M["fferr"],
+            "cpu_qemu": _cpu_pct(M, "cap", cap.pid if cap else None, now),
+            "cpu_ffmpeg": _cpu_pct(M, "ff", ff.pid if ff else None, now),
+            "ncpu": os.cpu_count()}
+
+
 def _hls_branch(bid=None):
     """Branch whose live HLS to serve: explicit, else first running."""
     if bid in BR:
@@ -2137,6 +2205,7 @@ def _run_pipeline(br):
             return "missing executable: %s" % need, False
     br["caplog"].clear()
     br["fflog"].clear()
+    br["M"] = M = _new_metrics()
     now = time.time()
     with LOCK:
         st = br["ST"]
@@ -2155,7 +2224,8 @@ def _run_pipeline(br):
         ff = subprocess.Popen(_mjpeg_cmd(br), stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         br["PIPE"]["ff"] = ff
-        threading.Thread(target=_drain_lines, args=(ff.stderr, br["fflog"]),
+        threading.Thread(target=_drain_lines,
+                         args=(ff.stderr, br["fflog"], (M, "fferr")),
                          daemon=True).start()
         threading.Thread(target=split_jpegs, args=(ff, br),
                          daemon=True).start()
@@ -2213,15 +2283,27 @@ def _run_pipeline(br):
             if now - last_scan > 1.0:
                 # Resync if rehost skipped an index (or we fell behind).
                 last_scan = now
-                idx = sorted(i for i in map(
-                    _frame_index, glob.glob(os.path.join(rundir, "v_*.bin")))
-                    if i > n)
+                allidx = [i for i in map(_frame_index, glob.glob(
+                    os.path.join(rundir, "v_*.bin"))) if i >= 0]
+                for i in allidx:
+                    if i < n:
+                        # rehost wrote again to a frame we already
+                        # consumed: frames are not written in one go.
+                        M["late_writes"] += 1
+                        try:
+                            os.remove(vp(i))
+                        except OSError:
+                            pass
+                idx = sorted(i for i in allidx if i > n)
                 if idx and now - max(last_frame_t, st["started_t"]) > 1.0:
+                    M["skips"] += 1
+                    M["skipped_frames"] += idx[0] - n
                     n = idx[0]
                     continue
             time.sleep(POLL_S)
             continue
-        if not os.path.exists(vp(n + 1)):
+        via_next = os.path.exists(vp(n + 1))
+        if not via_next:
             # Newest file: rehost may still be writing it.
             try:
                 sz = os.path.getsize(path)
@@ -2248,6 +2330,8 @@ def _run_pipeline(br):
         n += 1
         if not b:
             continue
+        M["next_reads" if via_next else "stable_reads"] += 1
+        M["in"].append((now, len(b), _is_key(b)))
         last_frame_t = now
         if not primed:
             if not has_params(b):
@@ -2459,7 +2543,8 @@ button.on{outline:2px solid #2a6}
 <div class="card">
 <b>Live stream (what Home Assistant sees: /video.mjpg)</b>
 <div style="margin-top:6px"><img id="main-img" alt="live" style="width:100%;background:#000;border-radius:4px;min-height:200px"></div>
-<div id="main-stats" class="muted" style="margin-top:6px;font-family:monospace;font-size:12px">idle</div>
+<div id="main-stats" class="muted" style="margin-top:6px;font-family:monospace;font-size:12px;white-space:pre-wrap">idle</div>
+<div class="muted" style="margin-top:4px;font-size:12px">Full diagnostics: <a href="/stats" target="_blank">/stats</a></div>
 <div class="muted" style="margin-top:6px;font-size:12px">The pipeline starts when someone watches and stops after the idle timeout. A "Connecting to camera..." frame is shown during the 10-30 s cold start; if the camera stops sending frames the watchdog restarts the session automatically.</div>
 </div>
 </div><!-- /tab-main -->
@@ -3704,7 +3789,12 @@ setInterval(function(){
       ms.textContent=(mb.running?'LIVE':'idle')+' mode='+s.live_mode+' transport='+mb.transport+
         ' decoded='+mb.decoded+' frame_age='+(mb.frame_age_ms==null?'-':mb.frame_age_ms+'ms')+
         ' first_frame='+(mb.first_frame_s==null?'-':mb.first_frame_s+'s')+' restarts='+mb.restarts+
-        (mb.last_exit?' last_exit="'+mb.last_exit+'"':'')+(mb.next_start_in_s?' retry_in='+mb.next_start_in_s+'s':'');}
+        (mb.last_exit?' last_exit="'+mb.last_exit+'"':'')+(mb.next_start_in_s?' retry_in='+mb.next_start_in_s+'s':'');
+      var dg=mb.diag||{};
+      ms.textContent+='\ncamera: '+dg.in_fps+' fps in, '+dg.in_kbps+' kbps, frame avg '+dg.avg_frame_kb+' KB / max '+dg.max_frame_kb+' KB, keyframe every '+(dg.gop_s==null?'-':dg.gop_s+'s')+
+        '\ndecoder: '+dg.decoded_fps+' fps out, errors '+dg.decoder_errors+
+        '\nreader: next '+dg.reads_next+' / stable '+dg.reads_stable+', late writes '+dg.late_writes+', skips '+dg.skips+' ('+dg.skipped_frames+' frames)'+
+        '\ncpu: qemu '+(dg.cpu_qemu==null?'-':dg.cpu_qemu+'%')+', ffmpeg '+(dg.cpu_ffmpeg==null?'-':dg.cpu_ffmpeg+'%')+' (100% = 1 core, '+dg.ncpu+' cores)';}
     if(ls)ls.textContent=txt;
     if(rs)rs.textContent=txt;
     var t=document.getElementById('tr');
@@ -4072,7 +4162,8 @@ class Handler(BaseHTTPRequestHandler):
                         "hls_n": st["hls_n"], "hls_bytes": st["hls_bytes"],
                         "hls_drop": st["hls_drop"],
                         "hls_err": st["hls_err"],
-                        "rehost_log": list(br["caplog"])[-5:]}
+                        "rehost_log": list(br["caplog"])[-5:],
+                        "diag": _diag(br, now)}
 
             branches = {BR[k]["name"]: _br(k) for k in ("0", "1", "2")}
             vals = list(sts.values())
