@@ -6,7 +6,7 @@ on:
       version:
         description: Add-on version (must match ubox/config.yaml)
         required: true
-        default: 0.1.0
+        default: 0.8.0
 
 permissions:
   contents: read
@@ -32,8 +32,8 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          # GITHUB_TOKEN fad6fedc write_package (account-level cap):
-          # use PAT secret instead (needs write:packages, this one has it).
+          # Use a PAT secret with write:packages (GITHUB_TOKEN may lack it):
+          # Settings -> Secrets -> Actions -> GHCR_PAT.
           password: ${{ secrets.GHCR_PAT }}
 
       - uses: docker/build-push-action@v6
@@ -42,4 +42,4 @@ jobs:
           platforms: linux/${{ matrix.arch }}
           build-args: BUILD_FROM=python:3.12-slim-bookworm
           push: true
-          tags: ghcr.io/wocaca/${{ matrix.arch }}-addon-ubox:${{ env.VERSION }}
+          tags: ghcr.io/${{ github.repository_owner }}/${{ matrix.arch }}-addon-ubox:${{ env.VERSION }}

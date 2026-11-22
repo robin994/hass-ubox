@@ -1,4 +1,3 @@
-name: UBox Camera
-description: UBox camera live stream (pure local, on-demand)
-url: https://github.com/wocaca/hass-ubox
-maintainer: wocaca
+name: UBox Camera (English, stable stream)
+url: https://github.com/robin994/hass-ubox
+maintainer: robin994 (fork of wocaca/hass-ubox)

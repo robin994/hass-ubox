@@ -1,0 +1,32 @@
+configuration:
+  http_username:
+    name: Page username
+    description: Username for the add-on web page and streams (Basic auth).
+  http_password:
+    name: Page password
+    description: >-
+      Empty = no protection. When set, use
+      http://<ip>:8089/video.mjpg?key=<password> in Home Assistant.
+  stream:
+    name: Camera stream
+    description: 1 = main stream (high resolution), 0 = sub stream (low resolution, much lighter on CPU).
+  fps:
+    name: FPS limit
+    description: 0 = pass every camera frame through (recommended). 1-30 caps the MJPEG frame rate.
+  jpeg_quality:
+    name: JPEG quality
+    description: 2 = best quality / biggest frames, 31 = worst. 4-6 is a good balance.
+  max_width:
+    name: Max width (px)
+    description: 0 = original size. e.g. 1280 to downscale and save CPU and bandwidth (Raspberry Pi).
+  idle_timeout:
+    name: Idle timeout (s)
+    description: Stop the camera session this many seconds after the last viewer leaves.
+  stall_timeout:
+    name: Stall timeout (s)
+    description: Restart the session automatically when no frame arrives for this long.
+  live_mode:
+    name: Live mode
+    description: >-
+      single = one P2P session following the transport setting (recommended).
+      failover = two sessions (direct + relay) at once, freshest frame wins (double CPU and camera load).
