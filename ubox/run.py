@@ -31,6 +31,7 @@ import errno
 import glob
 import hashlib
 import hmac
+import io
 import json
 import os
 import queue
@@ -40,6 +41,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import tarfile
 import threading
 import time
 import urllib.error
@@ -1137,7 +1139,7 @@ def _new_branch(bid, name, transport, rundir, hlsdir):
             "WAKE": threading.Event(),
             "PLOCK": threading.Lock(),
             "thread": None, "want_stop": False,
-            "caplog": collections.deque(maxlen=60),
+            "caplog": collections.deque(maxlen=3000),
             "fflog": collections.deque(maxlen=20),
             "M": _new_metrics(),
             "rundir": rundir, "hlsdir": hlsdir,
@@ -2056,6 +2058,125 @@ def _diag(br, now, win=10.0):
             "ncpu": os.cpu_count()}
 
 
+# ---- Debug capture: record exactly what rehost hands us, for offline
+# analysis (raw frames + timings + run-dir listings + logs).
+CAPTURE = {"br": None, "t0": 0.0, "frames": [], "bytes": 0,
+           "listing": [], "lock": threading.Lock()}
+CAPTURE_MAX_BYTES = 80 * 1024 * 1024
+
+
+def _capture_frame(now, idx, b, via_next):
+    with CAPTURE["lock"]:
+        if CAPTURE["bytes"] + len(b) > CAPTURE_MAX_BYTES:
+            return
+        CAPTURE["frames"].append((now - CAPTURE["t0"], idx, via_next, b))
+        CAPTURE["bytes"] += len(b)
+
+
+def _capture_lister(br, until):
+    """Snapshot the run dir (names + sizes) every 0.25 s."""
+    rundir = br["rundir"]
+    while time.time() < until and CAPTURE["br"] is br:
+        t = time.time() - CAPTURE["t0"]
+        rows = []
+        for root, _, files in os.walk(rundir):
+            for f in files:
+                fp = os.path.join(root, f)
+                try:
+                    rows.append((os.path.relpath(fp, rundir),
+                                 os.path.getsize(fp)))
+                except OSError:
+                    pass
+        with CAPTURE["lock"]:
+            CAPTURE["listing"].append((round(t, 3), sorted(rows)))
+        time.sleep(0.25)
+
+
+def _redact(text):
+    for secret in (DEV.get("password"), _cloud_password,
+                   OPT.get("http_password")):
+        if secret:
+            text = text.replace(secret, "***")
+    return text
+
+
+def run_capture(secs):
+    """Watch the main branch for `secs` seconds and return a .tar.gz."""
+    br = BR["0"]
+    with CAPTURE["lock"]:
+        if CAPTURE["br"] is not None:
+            return None, "a capture is already running"
+    with LOCK:
+        br["ST"]["subs"] += 1
+        br["ST"]["last_sub_t"] = time.time()
+    br["WAKE"].set()
+    try:
+        deadline = time.time() + STARTUP_TIMEOUT + 15
+        while time.time() < deadline:
+            with LOCK:
+                st = dict(br["ST"])
+            if st["running"] and st["first_frame_t"] >= st["started_t"] > 0:
+                break
+            time.sleep(0.2)
+        else:
+            return None, ("no video from the camera within %ds (last exit: %s)"
+                          % (STARTUP_TIMEOUT + 15, st.get("last_exit")))
+        with CAPTURE["lock"]:
+            CAPTURE.update(br=br, t0=time.time(), frames=[], bytes=0,
+                           listing=[])
+        until = time.time() + secs
+        threading.Thread(target=_capture_lister, args=(br, until),
+                         daemon=True).start()
+        while time.time() < until:
+            with LOCK:
+                br["ST"]["last_sub_t"] = time.time()
+            time.sleep(0.2)
+        stats = {"diag": _diag(br, time.time(), win=float(secs)),
+                 "options": {k: OPT.get(k) for k in SETTING_KEYS
+                             if k != "http_password"},
+                 "transport": dict(TR), "iso": br["iso"],
+                 "st": {k: v for k, v in br["ST"].items()}}
+    finally:
+        with CAPTURE["lock"]:
+            frames, listing = CAPTURE["frames"], CAPTURE["listing"]
+            CAPTURE.update(br=None, frames=[], listing=[], bytes=0)
+        with LOCK:
+            br["ST"]["subs"] = max(0, br["ST"]["subs"] - 1)
+            br["ST"]["last_sub_t"] = time.time()
+    lines = list(br["caplog"])  # whole session incl. handshake
+    csv = ["t_s,index,bytes,read_via,is_key,nal_types"]
+    raw = bytearray()
+    for t, idx, via_next, b in frames:
+        types = [(m[0] >> 1) & 0x3F for m in NAL_RE.findall(b)]
+        csv.append("%.3f,%d,%d,%s,%d,%s" % (
+            t, idx, len(b), "next" if via_next else "stable",
+            1 if _is_key(b) else 0, " ".join(map(str, types))))
+        raw += b
+    files = {
+        "README.txt": ("UBox add-on debug capture, %d s, %d frames.\n"
+                       "frames.h265 = every access unit as received, in "
+                       "order (Annex-B). frames.csv = per-file timing. "
+                       "listing.txt = run dir every 0.25 s. Passwords "
+                       "redacted.\n" % (secs, len(frames))).encode(),
+        "frames.h265": bytes(raw),
+        "frames.csv": ("\n".join(csv) + "\n").encode(),
+        "listing.txt": "\n".join(
+            "%.3f %s" % (t, " ".join("%s:%d" % r for r in rows))
+            for t, rows in listing).encode(),
+        "rehost.log": _redact("\n".join(lines)).encode("utf-8"),
+        "ffmpeg.log": _redact("\n".join(br["fflog"])).encode("utf-8"),
+        "stats.json": _redact(json.dumps(stats, indent=1,
+                                         default=str)).encode("utf-8"),
+    }
+    out = io.BytesIO()
+    with tarfile.open(fileobj=out, mode="w:gz") as tf:
+        for name, data in files.items():
+            ti = tarfile.TarInfo("ubox-capture/" + name)
+            ti.size, ti.mtime = len(data), int(time.time())
+            tf.addfile(ti, io.BytesIO(data))
+    return out.getvalue(), None
+
+
 def _hls_branch(bid=None):
     """Branch whose live HLS to serve: explicit, else first running."""
     if bid in BR:
@@ -2332,6 +2453,8 @@ def _run_pipeline(br):
             continue
         M["next_reads" if via_next else "stable_reads"] += 1
         M["in"].append((now, len(b), _is_key(b)))
+        if CAPTURE["br"] is br:
+            _capture_frame(now, n - 1, b, via_next)
         last_frame_t = now
         if not primed:
             if not has_params(b):
@@ -2545,6 +2668,7 @@ button.on{outline:2px solid #2a6}
 <div style="margin-top:6px"><img id="main-img" alt="live" style="width:100%;background:#000;border-radius:4px;min-height:200px"></div>
 <div id="main-stats" class="muted" style="margin-top:6px;font-family:monospace;font-size:12px;white-space:pre-wrap">idle</div>
 <div class="muted" style="margin-top:4px;font-size:12px">Full diagnostics: <a href="/stats" target="_blank">/stats</a></div>
+<div style="margin-top:8px"><button onclick="debugCapture()">Debug capture (20 s)</button> <span id="cap-msg" class="muted" style="font-size:12px">Records 20 s of raw camera frames + logs into a .tar.gz to download (passwords redacted).</span></div>
 <div class="muted" style="margin-top:6px;font-size:12px">The pipeline starts when someone watches and stops after the idle timeout. A "Connecting to camera..." frame is shown during the 10-30 s cold start; if the camera stops sending frames the watchdog restarts the session automatically.</div>
 </div>
 </div><!-- /tab-main -->
@@ -3168,6 +3292,20 @@ function stopStream(kind){
   sdHlsDestroy(lhv);
   stopLiveHlsPoll();
   fmsg('Stopped (pipeline killed)');
+}
+function debugCapture(){
+  var m=document.getElementById('cap-msg');
+  if(m)m.textContent='Recording… (starts the stream if needed, up to ~2 min)';
+  fetch('/api/debug/capture?secs=20').then(function(r){
+    if(!r.ok)return r.text().then(function(t){throw new Error(t);});
+    var cd=r.headers.get('Content-Disposition')||'';
+    var mm=/filename="([^"]+)"/.exec(cd);
+    return r.blob().then(function(b){return {b:b,n:mm?mm[1]:'ubox-capture.tar.gz'};});
+  }).then(function(x){
+    var a=document.createElement('a');a.href=URL.createObjectURL(x.b);a.download=x.n;
+    document.body.appendChild(a);a.click();a.remove();
+    if(m)m.textContent='Saved '+x.n+' ('+Math.round(x.b.size/1024)+' KB)';
+  }).catch(function(e){if(m)m.textContent='Capture failed: '+e.message;});
 }
 function snapNow(){
   var v=document.getElementById('snap-view');
@@ -4331,6 +4469,32 @@ class Handler(BaseHTTPRequestHandler):
                      "mp4": "video/mp4"}[fn.rsplit(".", 1)[1]]
             self._send(200, ctype, body)
             return
+        elif path == "/api/debug/capture":
+            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+            secs = 20
+            for kv in qs.split("&"):
+                if kv.startswith("secs="):
+                    try:
+                        secs = max(5, min(60, int(kv[5:])))
+                    except ValueError:
+                        pass
+            if not DEV["uid"] or not DEV["password"]:
+                self._send(503, "text/plain",
+                           b"device not configured (log in on the web page)")
+                return
+            data, err = run_capture(secs)
+            if err:
+                self._send(409 if "already" in err else 504, "text/plain",
+                           err.encode())
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/gzip")
+            self.send_header("Content-Disposition",
+                             'attachment; filename="ubox-capture-%s.tar.gz"'
+                             % time.strftime("%Y%m%d-%H%M%S"))
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
         elif path == "/hls.js":
             self._send_hls_js()
             return
